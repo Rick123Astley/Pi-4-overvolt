@@ -1,52 +1,67 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <stdint.h>
-#include <errno.h>
 #include <string.h>
+#include <errno.h>
 
-// We will scan the first 512MB of physical RAM. 
-// This is where the Pi 4 firmware and hardware control structures reside.
-#define SCAN_SIZE (512 * 1024 * 1024) 
-#define BLOCK_SIZE (1 * 1024 * 1024) // 1MB chunks to be safe
+// Mirroring the Pi 5's use of VC_MEM IOCTLs
+#define VC_MEM_IOC_MAGIC 'v'
+#define VC_MEM_IOC_MEM_SIZE _IOR(VC_MEM_IOC_MAGIC, 1, unsigned long)
 
 int main() {
-    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    int fd;
+    volatile unsigned char *vc;
+    unsigned long size;
+    
+    // 1. Open the same device as the Pi 5 code
+    fd = open("/dev/vc-mem", O_RDWR | O_SYNC);
     if (fd == -1) {
-        perror("Error opening /dev/mem (Are you root? Is iomem=relaxed set?)");
+        perror("unable to open /dev/vc-mem");
         return 1;
     }
 
-    printf("Starting Global System RAM scan for CPU voltage lock...\n");
+    // 2. Get the GPU memory size to calculate the offset
+    ioctl(fd, VC_MEM_IOC_MEM_SIZE, &size);
 
-    for (uint64_t offset = 0; offset < SCAN_SIZE; offset += BLOCK_SIZE) {
-        unsigned char *map_base = mmap(0, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
-        
-        if (map_base == MAP_FAILED) {
-            continue; // Skip areas the kernel won't let us touch
-        }
+    // On Pi 5, the offset was roughly at the end of RAM.
+    // On Pi 4, the firmware usually sits in the top few MBs of the GPU cutout.
+    // We map a 4MB window at the very top of the reported VC memory.
+    unsigned long my_size = (1024 * 1024 * 4); 
+    unsigned long offset = size - my_size;
 
-        for (uint32_t i = 0; i < BLOCK_SIZE - 12; i++) {
-            // Searching for the logic: cmp rX, 6 | mov.cs rY, rX | mov.cc rY, 6
-            // Based on your previous dump, we use the VC6 instruction anchors:
-            if (map_base[i] == 0x07 && map_base[i+1] == 0x4a && 
-                map_base[i+4] == 0x07 && map_base[i+5] == 0xc0) {
-                
-                printf("MATCH FOUND at Physical Address: 0x%llx\n", (long long)(offset + i));
-                
-                // Check if this is the specific 'over_voltage' clamp
-                // We overwrite the limit to allow the CPU to pull more voltage
-                printf("Patching CPU Voltage limit...\n");
-                map_base[i+10] = 0x86; 
-                map_base[i+11] = 0x01;
-            }
-        }
-        munmap(map_base, BLOCK_SIZE);
+    printf("Mapping 4MB window at top of VC-Mem (Offset: 0x%lx)\n", offset);
+
+    vc = (unsigned char *)mmap(0, my_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset);
+    
+    if (vc == (unsigned char *)-1) {
+        printf("mmap failed: %s\n", strerror(errno));
+        return -1;
     }
 
-    printf("Scan complete.\n");
+    // 3. Search and Patch using the Pi 4 (VC6) instruction set
+    // We are looking for the clamp logic: cmp r6, 6 | mov.cs r7, r6 | mov.cc r7, 6
+    for (int i = 0; i < my_size - 12; i++) {
+        // This is the VC6 equivalent of your Pi 5's "A6 4A..." signature
+        // It matches the '77 fc 07 4a' we found in your start4.elf dump
+        if(vc[i] == 0x77 && vc[i+1] == 0xfc && vc[i+2] == 0x07 && vc[i+3] == 0x4a) 
+        {
+            printf("Found Overvolt Limit Signature! Replacing...\n");
+            
+            // The Patch:
+            // We jump to the 'mov.cc r7, 6' instruction and change it to 'mov.cc r7, r6'
+            // This mirrors your Pi 5 patch: 8A 51 -> 86 01 (for VC6 registers)
+            vc[i+10] = 0x86; 
+            vc[i+11] = 0x01;
+            printf("Patch applied at address %p\n", &vc[i+10]);
+        }
+    }
+
     close(fd);
+    printf("Done.\n");
     return 0;
 }
