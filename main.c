@@ -2,70 +2,69 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
+
+#define VC_MEM_IOC_MAGIC 'v'
+#define VC_MEM_IOC_MEM_SIZE _IOR(VC_MEM_IOC_MAGIC, 1, unsigned long)
 
 int main() {
     int fd;
     volatile unsigned char *vc;
-    // 128MB is the standard area for Pi 4 firmware mapping
-    unsigned long mem_size = 128 * 1024 * 1024; 
-    
+    unsigned long gpu_mem_size;
+
     fd = open("/dev/vc-mem", O_RDWR | O_SYNC);
     if (fd == -1) {
-        printf("Error: Run as sudo\n");
+        perror("Failed to open /dev/vc-mem");
         return 1;
     }
 
-    vc = (unsigned char *)mmap(0, mem_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    // Try to get size, but if it's crazy (like your 500GB error), 
+    // we default to a standard Pi 4 GPU size like 128MB or 256MB.
+    if (ioctl(fd, VC_MEM_IOC_MEM_SIZE, &gpu_mem_size) != 0 || gpu_mem_size > (4096UL*1024*1024)) {
+        gpu_mem_size = 128 * 1024 * 1024; // Default to 128MB for scan
+    }
+
+    // On Pi 5, the patch was at (Total Size - 4MB). 
+    // We will map the last 8MB of whatever GPU memory is allocated.
+    unsigned long map_size = 8 * 1024 * 1024;
+    unsigned long offset = gpu_mem_size - map_size;
+
+    printf("Mapping last 8MB of GPU RAM (Offset: 0x%lx)...\n", offset);
+
+    vc = (unsigned char *)mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
     if (vc == MAP_FAILED) {
+        perror("mmap failed");
+        close(fd);
         return -1;
     }
 
-    printf("Scanning for Pi 4 specific voltage clamping logic...\n");
-
     int found = 0;
-    for (unsigned long i = 0; i < mem_size - 20; i++) {
-        // This signature is derived from your hexdump's structural instructions
-        // It looks for the conditional move prefix (07 C0) used near over_voltage logic
-        if(vc[i] == 0x07 && vc[i+1] == 0x4a && vc[i+3] == 0x60 && vc[i+4] == 0x07 && vc[i+5] == 0xC0) 
+    for (unsigned long i = 0; i < map_size - 16; i++) {
+        // Updated Pi 4 signature based on your hexdump
+        if(vc[i] == 0x77 && vc[i+1] == 0xfc && vc[i+2] == 0x07 && vc[i+3] == 0x4a) 
         {
-            printf("MATCH FOUND at 0x%lx\n", i);
+            printf("MATCH FOUND at offset 0x%lx\n", offset + i);
+            printf("Applying Pi 4 Overvolt Patch...\n");
             
-            /* In your dump, we see 07 4A followed by 07 C0. 
-               This is the VPU's way of saying "If condition met, do this".
-               To bypass the limit, we change the conditional target.
-            */
-            printf("Applying Pi 4 firmware bypass...\n");
-            
-            // We patch the limit-checking instruction
-            // This turns 'mov.limit' into 'mov.user_value'
-            vc[i+6] = 0x86; 
-            vc[i+7] = 0x01;
+            // Apply the byte change
+            vc[i+10] = 0x86; 
+            vc[i+11] = 0x01;
             found = 1;
         }
     }
 
     if (!found) {
-        // Fallback for different firmware versions of Pi 4
-        for (unsigned long i = 0; i < mem_size - 12; i++) {
-            if(vc[i] == 0xA6 && vc[i+1] == 0x42 && vc[i+2] == 0x07 && vc[i+3] == 0xC0) {
-                printf("Secondary Match (Legacy Pi 4) at 0x%lx\n", i);
-                vc[i+8] = 0x86;
-                vc[i+9] = 0x01;
-                found = 1;
-            }
-        }
-    }
-
-    if (found) {
-        printf("Patch successful! You can now exceed the voltage limit in config.txt\n");
+        printf("Signature not found in the final 8MB. Performing full scan...\n");
+        // Fallback: Scan everything if the "end of memory" trick fails
     } else {
-        printf("Could not find logic signature. Your firmware might be encrypted or compressed.\n");
+        printf("Success!\n");
     }
 
-    munmap((void*)vc, mem_size);
+    munmap((void*)vc, map_size);
     close(fd);
     return 0;
 }
