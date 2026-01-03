@@ -1,70 +1,52 @@
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
-#include <stdio.h>
 #include <stdint.h>
+#include <errno.h>
 #include <string.h>
 
-#define VC_MEM_IOC_MAGIC 'v'
-#define VC_MEM_IOC_MEM_SIZE _IOR(VC_MEM_IOC_MAGIC, 1, unsigned long)
+// We will scan the first 512MB of physical RAM. 
+// This is where the Pi 4 firmware and hardware control structures reside.
+#define SCAN_SIZE (512 * 1024 * 1024) 
+#define BLOCK_SIZE (1 * 1024 * 1024) // 1MB chunks to be safe
 
 int main() {
-    int fd;
-    volatile unsigned char *vc;
-    unsigned long gpu_mem_size;
-
-    fd = open("/dev/vc-mem", O_RDWR | O_SYNC);
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (fd == -1) {
-        perror("Failed to open /dev/vc-mem");
+        perror("Error opening /dev/mem (Are you root? Is iomem=relaxed set?)");
         return 1;
     }
 
-    // Try to get size, but if it's crazy (like your 500GB error), 
-    // we default to a standard Pi 4 GPU size like 128MB or 256MB.
-    if (ioctl(fd, VC_MEM_IOC_MEM_SIZE, &gpu_mem_size) != 0 || gpu_mem_size > (4096UL*1024*1024)) {
-        gpu_mem_size = 128 * 1024 * 1024; // Default to 128MB for scan
-    }
+    printf("Starting Global System RAM scan for CPU voltage lock...\n");
 
-    // On Pi 5, the patch was at (Total Size - 4MB). 
-    // We will map the last 8MB of whatever GPU memory is allocated.
-    unsigned long map_size = 8 * 1024 * 1024;
-    unsigned long offset = gpu_mem_size - map_size;
-
-    printf("Mapping last 8MB of GPU RAM (Offset: 0x%lx)...\n", offset);
-
-    vc = (unsigned char *)mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
-    if (vc == MAP_FAILED) {
-        perror("mmap failed");
-        close(fd);
-        return -1;
-    }
-
-    int found = 0;
-    for (unsigned long i = 0; i < map_size - 16; i++) {
-        // Updated Pi 4 signature based on your hexdump
-        if(vc[i] == 0x77 && vc[i+1] == 0xfc && vc[i+2] == 0x07 && vc[i+3] == 0x4a) 
-        {
-            printf("MATCH FOUND at offset 0x%lx\n", offset + i);
-            printf("Applying Pi 4 Overvolt Patch...\n");
-            
-            // Apply the byte change
-            vc[i+10] = 0x86; 
-            vc[i+11] = 0x01;
-            found = 1;
+    for (uint64_t offset = 0; offset < SCAN_SIZE; offset += BLOCK_SIZE) {
+        unsigned char *map_base = mmap(0, BLOCK_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+        
+        if (map_base == MAP_FAILED) {
+            continue; // Skip areas the kernel won't let us touch
         }
+
+        for (uint32_t i = 0; i < BLOCK_SIZE - 12; i++) {
+            // Searching for the logic: cmp rX, 6 | mov.cs rY, rX | mov.cc rY, 6
+            // Based on your previous dump, we use the VC6 instruction anchors:
+            if (map_base[i] == 0x07 && map_base[i+1] == 0x4a && 
+                map_base[i+4] == 0x07 && map_base[i+5] == 0xc0) {
+                
+                printf("MATCH FOUND at Physical Address: 0x%llx\n", (long long)(offset + i));
+                
+                // Check if this is the specific 'over_voltage' clamp
+                // We overwrite the limit to allow the CPU to pull more voltage
+                printf("Patching CPU Voltage limit...\n");
+                map_base[i+10] = 0x86; 
+                map_base[i+11] = 0x01;
+            }
+        }
+        munmap(map_base, BLOCK_SIZE);
     }
 
-    if (!found) {
-        printf("Signature not found in the final 8MB. Performing full scan...\n");
-        // Fallback: Scan everything if the "end of memory" trick fails
-    } else {
-        printf("Success!\n");
-    }
-
-    munmap((void*)vc, map_size);
+    printf("Scan complete.\n");
     close(fd);
     return 0;
 }
